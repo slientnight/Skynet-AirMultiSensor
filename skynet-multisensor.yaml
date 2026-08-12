@@ -112,16 +112,20 @@ wifi:
   password: !secret wifi_password
   #use_address: 192.168.5.51
   min_auth_mode: WPA2
+  # Enable 802.11k/v to better support mesh wireless networks.
+  # Allows the mesh APs to steer the device to the best node
+  # without needing to pin a BSSID.
+  enable_btm: true
+  enable_rrm: true
   # Enable fallback hotspot (captive portal) in case wifi connection fails
   ap:
     ssid: ${upper_devicename} Hotspot
-    password: !secret master_skynet_multisensor__ap_password
-
+    password: !secret ap_fallback_password
 captive_portal:
 
 ota:
   - platform: esphome
-    password: !secret master_skynet_multisensor__ota_password
+    password: !secret ota_password
 
 # Enable logging
 logger:
@@ -133,7 +137,7 @@ debug:
 # Enable Home Assistant API
 api:
   encryption:
-    key: !secret master_skynet_multisensor__encryption_key
+    key: !secret api_key
   actions:
     - action: set_ambient_pressure
       variables:
@@ -208,6 +212,9 @@ globals:
   - { id: g_rh_sigma, type: float, restore_value: no, initial_value: '0' }
   - { id: g_rh_chi2,  type: float, restore_value: no, initial_value: '0' }
   - { id: g_rh_n,     type: int,   restore_value: no, initial_value: '0' }
+  # ---- last-change timestamps (millis) and previous values for 16 sensors ----
+  - { id: prev_val,  type: 'float[16]', restore_value: no, initial_value: '{NAN,NAN,NAN,NAN,NAN,NAN,NAN,NAN,NAN,NAN,NAN,NAN,NAN,NAN,NAN,NAN}' }
+  - { id: chg_ms,    type: 'uint32_t[16]', restore_value: no, initial_value: '{0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}' }
 
 switch:
   - platform: restart
@@ -605,42 +612,55 @@ font:
       type: gfonts
       family: Roboto Condensed
       weight: 400
+    id: font_header
+    size: 14
+    glyphs: &glyphset "!\"%'()+=,-_.:/°µ³0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz "
+  - file:
+      type: gfonts
+      family: Roboto Condensed
+      weight: 400
     id: font_label
     size: 10
-    glyphs: &glyphset "!\"%'()+=,-_.:/°µ³0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz "
+    glyphs: *glyphset
   - file:
       type: gfonts
       family: Roboto Condensed
       weight: 700
     id: font_value
-    size: 27
+    size: 28
     glyphs: *glyphset
   - file:
       type: gfonts
       family: Roboto Condensed
       weight: 400
     id: font_big_label
-    size: 22
+    size: 18
     glyphs: *glyphset
   - file:
       type: gfonts
       family: Roboto Condensed
       weight: 700
     id: font_big
-    size: 46
+    size: 44
     glyphs: *glyphset
 
 color:
   - id: c_bg
-    hex: "000000"
+    hex: "0A0E14"
+  - id: c_card
+    hex: "141C24"
+  - id: c_border
+    hex: "1E2A36"
   - id: c_white
-    hex: "FFFFFF"
+    hex: "F0F4F8"
   - id: c_dim
-    hex: "B0BCC8"
+    hex: "8899A6"
   - id: c_dot
-    hex: "40505C"
+    hex: "2A3A4A"
   - id: c_accent
     hex: "18A0C8"
+  - id: c_fresh
+    hex: "20D4A0"
   - id: c_warm
     hex: "F0A030"
   - id: c_green
@@ -1318,40 +1338,112 @@ display:
       height: 320
     update_interval: never
     lambda: |-
+      const uint32_t now = millis();
+      const uint32_t FRESH_MS = 300000;  // 5 minutes
+
+      // ---- value formatter ----
       auto v = [](esphome::sensor::Sensor *s, int dec) -> std::string {
         if (s == nullptr || !s->has_state() || std::isnan(s->state)) return "--";
         char buf[16];
         snprintf(buf, sizeof(buf), "%.*f", dec, s->state);
         return std::string(buf);
       };
+
+      // ---- threshold color picker ----
       auto pick = [&](esphome::sensor::Sensor *s, float mod, float high) -> Color {
         if (s == nullptr || !s->has_state() || std::isnan(s->state)) return id(c_dim);
         if (s->state >= high) return id(c_red);
         if (s->state >= mod)  return id(c_yellow);
         return id(c_green);
       };
-      // Dense cell: label 10px at cy, value 27px at cy+11. Row pitch 40.
-      auto cell = [&](int cx, int cy, const char *label,
-                      esphome::sensor::Sensor *s, int dec, float mod, float high) {
-        it.print(cx, cy, id(font_label), id(c_dim), TextAlign::TOP_CENTER, label);
-        it.printf(cx, cy + 11, id(font_value), pick(s, mod, high),
-                  TextAlign::TOP_CENTER, "%s", v(s, dec).c_str());
-      };
-      // Big cell: label 22px at cy, value 46px at cy+26.
-      auto big = [&](int cx, int cy, const char *label,
-                     esphome::sensor::Sensor *s, int dec, float mod, float high) {
-        it.print(cx, cy, id(font_big_label), id(c_dim), TextAlign::TOP_CENTER, label);
-        it.printf(cx, cy + 26, id(font_big), pick(s, mod, high),
-                  TextAlign::TOP_CENTER, "%s", v(s, dec).c_str());
-      };
-      const int A = 60;    // left column centre
-      const int B = 180;   // right column centre
-      const int Y1 = 45;   // top row (big layouts)
-      const int Y2 = 205;  // bottom row (big layouts)
-      const int mode = id(mode_index);   // 0 = All 16, 1 = Rotating, 2 = Highlight
 
-      // ---- temperature unit selection (fused sensor) ----
-      // explicit casts: the two id() results are distinct derived types
+      // ---- change tracker: updates prev_val/chg_ms, returns true if fresh ----
+      auto track = [&](int idx, esphome::sensor::Sensor *s) -> bool {
+        if (s == nullptr || !s->has_state() || std::isnan(s->state)) return false;
+        float cur = s->state;
+        float prev = id(prev_val)[idx];
+        if (std::isnan(prev) || fabsf(cur - prev) > 0.01f) {
+          id(prev_val)[idx] = cur;
+          id(chg_ms)[idx] = now;
+        }
+        return (now - id(chg_ms)[idx]) < FRESH_MS;
+      };
+
+      // ---- WiFi signal bars helper (0-4 bars) ----
+      auto wifi_bars = [&]() -> int {
+        if (!id(wifi_signal_db).has_state() || std::isnan(id(wifi_signal_db).state))
+          return 0;
+        float db = id(wifi_signal_db).state;
+        if (db >= -50) return 4;
+        if (db >= -60) return 3;
+        if (db >= -70) return 2;
+        if (db >= -80) return 1;
+        return 0;
+      };
+
+      // ---- draw header bar: device name left, WiFi icon right ----
+      auto draw_header = [&]() {
+        // Header background - subtle dark bar
+        it.filled_rectangle(0, 0, 240, 22, id(c_card));
+        // Bottom accent line
+        it.horizontal_line(0, 22, 240, id(c_border));
+        // Device name
+        it.print(6, 3, id(font_header), id(c_dim), TextAlign::TOP_LEFT, "SKYNET AIR");
+        // WiFi bars on the right
+        int bars = wifi_bars();
+        bool connected = bars > 0;
+        int bx = 210;  // start x for bars
+        int by = 18;   // baseline
+        for (int i = 0; i < 4; i++) {
+          int bh = 4 + i * 3;  // bar heights: 4, 7, 10, 13
+          Color bc = (i < bars) ? id(c_accent) : id(c_dot);
+          it.filled_rectangle(bx + i * 6, by - bh, 4, bh, bc);
+        }
+        // Small dot indicator: green = connected, red = disconnected
+        it.filled_circle(bx - 8, by - 6, 3, connected ? id(c_green) : id(c_red));
+      };
+
+      // ---- dense cell for All 16 mode (no box, max text) ----
+      auto cell = [&](int cx, int cy, int idx, const char *label,
+                      esphome::sensor::Sensor *s, int dec, float mod, float high) {
+        track(idx, s);
+        bool fresh = (s && s->has_state() && !std::isnan(s->state))
+                     && (now - id(chg_ms)[idx]) < FRESH_MS;
+        if (fresh) {
+          it.filled_circle(cx - 52, cy + 5, 3, id(c_fresh));
+        }
+        it.print(cx, cy, id(font_label), id(c_dim), TextAlign::TOP_CENTER, label);
+        it.printf(cx, cy + 12, id(font_value), pick(s, mod, high),
+                  TextAlign::TOP_CENTER, "%s", v(s, dec).c_str());
+      };
+
+      // ---- big card for Rotating / Highlight modes ----
+      auto big = [&](int x, int y, int w, int h, int idx, const char *label,
+                     esphome::sensor::Sensor *s, int dec, float mod, float high) {
+        bool fresh = track(idx, s);
+        // Card background
+        it.filled_rectangle(x, y, w, h, id(c_card));
+        // Border
+        it.rectangle(x, y, w, h, id(c_border));
+        // Left accent stripe (4px wide)
+        Color stripe = fresh ? id(c_fresh) : id(c_dot);
+        it.filled_rectangle(x, y, 4, h, stripe);
+        // Clip text to card bounds (left, top, right, bottom)
+        it.start_clipping(x + 4, y, x + w, y + h);
+        // Label
+        it.print(x + 10, y + 8, id(font_big_label), id(c_dim), TextAlign::TOP_LEFT, label);
+        // Value - centered in card
+        int vcx = x + w / 2;
+        int vcy = y + (h / 2) - 4;
+        it.printf(vcx, vcy, id(font_big), pick(s, mod, high),
+                  TextAlign::TOP_CENTER, "%s", v(s, dec).c_str());
+        it.end_clipping();
+      };
+
+      const int mode = id(mode_index);
+      const int HDR = 24;  // header height
+
+      // ---- temperature unit selection ----
       const bool use_f = id(use_fahrenheit).state;
       esphome::sensor::Sensor *t_sens = use_f
         ? static_cast<esphome::sensor::Sensor *>(id(temp_fused_F))
@@ -1360,67 +1452,87 @@ display:
       const float t_mod    = use_f ? ${temp_mod_f}  : ${temp_mod_c};
       const float t_high   = use_f ? ${temp_high_f} : ${temp_high_c};
 
+      // ---- clear and draw ----
       it.fill(id(c_bg));
 
       if (mode == 2) {
-        // ---------- Highlight: 4 key values, static ----------
-        big(A, Y1, t_label,    t_sens,            1, t_mod,        t_high);
-        big(B, Y1, "VOC",      id(sen_voc),       0, ${voc_mod},   ${voc_high});
-        big(A, Y2, "CO2 ppm",  id(scd_co2),       0, ${co2_mod},   ${co2_high});
-        big(B, Y2, "PM2.5 µg", id(pm_2_5),        1, ${pm25_mod},  ${pm25_high});
+        draw_header();
+        // ---------- Highlight: 2x2 large cards ----------
+        const int cw = 114;
+        const int ch = 144;
+        const int gx = 6;    // gap from edge
+        const int gy = 6;    // gap between cards
+        const int y1 = HDR + gy;
+        const int y2 = y1 + ch + gy;
+        big(gx,        y1, cw, ch, 0, t_label,    t_sens,      1, t_mod,       t_high);
+        big(gx+cw+gx,  y1, cw, ch, 1, "VOC",      id(sen_voc), 0, ${voc_mod},  ${voc_high});
+        big(gx,        y2, cw, ch, 2, "CO2 ppm",  id(scd_co2), 0, ${co2_mod},  ${co2_high});
+        big(gx+cw+gx,  y2, cw, ch, 3, "PM2.5 µg", id(pm_2_5),  1, ${pm25_mod}, ${pm25_high});
       } else if (mode == 1) {
-        // ---------- Rotating: 4 values per screen ----------
+        draw_header();
+        // ---------- Rotating: 2x2 large cards per page ----------
+        const int cw = 114;
+        const int ch = 140;
+        const int gx = 6;
+        const int gy = 6;
+        const int y1 = HDR + gy;
+        const int y2 = y1 + ch + gy;
         switch (id(page_index)) {
           case 0:
-            big(A, Y1, t_label,    t_sens,          1, t_mod,       t_high);
-            big(B, Y1, "RH %",     id(rh_fused),    0, ${rh_mod},   ${rh_high});
-            big(A, Y2, "AH g/m³",  id(abs_humidity),1, ${ah_mod},   ${ah_high});
-            big(B, Y2, "CO2 ppm",  id(scd_co2),     0, ${co2_mod},  ${co2_high});
+            big(gx,       y1, cw, ch, 0, t_label,    t_sens,          1, t_mod,      t_high);
+            big(gx+cw+gx, y1, cw, ch, 1, "RH %",     id(rh_fused),    0, ${rh_mod},  ${rh_high});
+            big(gx,       y2, cw, ch, 2, "AH g/m³",  id(abs_humidity),1, ${ah_mod},  ${ah_high});
+            big(gx+cw+gx, y2, cw, ch, 3, "CO2 ppm",  id(scd_co2),     0, ${co2_mod}, ${co2_high});
             break;
           case 1:
-            big(A, Y1, "PM1.0 µg", id(pm_1_0),      1, ${pm1_mod},  ${pm1_high});
-            big(B, Y1, "PM2.5 µg", id(pm_2_5),      1, ${pm25_mod}, ${pm25_high});
-            big(A, Y2, "PM4.0 µg", id(pm_4_0),      1, ${pm4_mod},  ${pm4_high});
-            big(B, Y2, "PM10 µg",  id(pm_10_0),     1, ${pm10_mod}, ${pm10_high});
+            big(gx,       y1, cw, ch, 4, "PM1.0 µg", id(pm_1_0),  1, ${pm1_mod},  ${pm1_high});
+            big(gx+cw+gx, y1, cw, ch, 5, "PM2.5 µg", id(pm_2_5),  1, ${pm25_mod}, ${pm25_high});
+            big(gx,       y2, cw, ch, 6, "PM4.0 µg", id(pm_4_0),  1, ${pm4_mod},  ${pm4_high});
+            big(gx+cw+gx, y2, cw, ch, 7, "PM10 µg",  id(pm_10_0), 1, ${pm10_mod}, ${pm10_high});
             break;
           case 2:
-            big(A, Y1, "VOC",      id(sen_voc),     0, ${voc_mod},  ${voc_high});
-            big(B, Y1, "NOx",      id(sen_nox),     0, ${nox_mod},  ${nox_high});
-            big(A, Y2, "NO2 ppm",  id(mics_no2),    2, ${no2_mod},  ${no2_high});
-            big(B, Y2, "CO ppm",   id(mics_co),     1, ${co_mod},   ${co_high});
+            big(gx,       y1, cw, ch, 8,  "VOC",     id(sen_voc),  0, ${voc_mod}, ${voc_high});
+            big(gx+cw+gx, y1, cw, ch, 9,  "NOx",     id(sen_nox),  0, ${nox_mod}, ${nox_high});
+            big(gx,       y2, cw, ch, 10, "NO2 ppm", id(mics_no2), 2, ${no2_mod}, ${no2_high});
+            big(gx+cw+gx, y2, cw, ch, 11, "CO ppm",  id(mics_co),  1, ${co_mod},  ${co_high});
             break;
           case 3:
-            big(A, Y1, "H2 ppm",   id(mics_h2),     1, ${h2_mod},   ${h2_high});
-            big(B, Y1, "EtOH ppm", id(mics_etoh),   1, ${etoh_mod}, ${etoh_high});
-            big(A, Y2, "CH4 ppm",  id(mics_ch4),    0, ${ch4_mod},  ${ch4_high});
-            big(B, Y2, "NH3 ppm",  id(mics_nh3),    1, ${nh3_mod},  ${nh3_high});
+            big(gx,       y1, cw, ch, 12, "H2 ppm",   id(mics_h2),   1, ${h2_mod},   ${h2_high});
+            big(gx+cw+gx, y1, cw, ch, 13, "EtOH ppm", id(mics_etoh), 1, ${etoh_mod}, ${etoh_high});
+            big(gx,       y2, cw, ch, 14, "CH4 ppm",  id(mics_ch4),  0, ${ch4_mod},  ${ch4_high});
+            big(gx+cw+gx, y2, cw, ch, 15, "NH3 ppm",  id(mics_nh3),  1, ${nh3_mod},  ${nh3_high});
             break;
         }
-        // ---------- page indicator dots ----------
+        // Page indicator dots - bottom center
         for (int i = 0; i < 4; i++) {
-          int dx = 84 + i * 24;
+          int dx = 96 + i * 16;
           if (i == id(page_index)) {
-            it.filled_circle(dx, 300, 5, id(c_accent));
+            it.filled_circle(dx, 312, 4, id(c_accent));
           } else {
-            it.filled_circle(dx, 300, 3, id(c_dot));
+            it.filled_circle(dx, 312, 2, id(c_dot));
           }
         }
       } else {
-        // ---------- All 16: dense. Rows pitched 40px from y=0. ----------
-        cell(A,   0, t_label,     t_sens,          1, t_mod,        t_high);
-        cell(B,   0, "RH %",      id(rh_fused),    0, ${rh_mod},    ${rh_high});
-        cell(A,  40, "AH g/m³",   id(abs_humidity),1, ${ah_mod},    ${ah_high});
-        cell(B,  40, "CO2 ppm",   id(scd_co2),     0, ${co2_mod},   ${co2_high});
-        cell(A,  80, "PM1.0 µg",  id(pm_1_0),      1, ${pm1_mod},   ${pm1_high});
-        cell(B,  80, "PM2.5 µg",  id(pm_2_5),      1, ${pm25_mod},  ${pm25_high});
-        cell(A, 120, "PM4.0 µg",  id(pm_4_0),      1, ${pm4_mod},   ${pm4_high});
-        cell(B, 120, "PM10 µg",   id(pm_10_0),     1, ${pm10_mod},  ${pm10_high});
-        cell(A, 160, "VOC",       id(sen_voc),     0, ${voc_mod},   ${voc_high});
-        cell(B, 160, "NOx",       id(sen_nox),     0, ${nox_mod},   ${nox_high});
-        cell(A, 200, "NO2 ppm",   id(mics_no2),    2, ${no2_mod},   ${no2_high});
-        cell(B, 200, "CO ppm",    id(mics_co),     1, ${co_mod},    ${co_high});
-        cell(A, 240, "H2 ppm",    id(mics_h2),     1, ${h2_mod},    ${h2_high});
-        cell(B, 240, "EtOH ppm",  id(mics_etoh),   1, ${etoh_mod},  ${etoh_high});
-        cell(A, 280, "CH4 ppm",   id(mics_ch4),    0, ${ch4_mod},   ${ch4_high});
-        cell(B, 280, "NH3 ppm",   id(mics_nh3),    1, ${nh3_mod},   ${nh3_high});
+        // ---------- All 16: no header, no boxes, biggest text ----------
+        const int A = 60;    // left column centre
+        const int B = 180;   // right column centre
+        const int rp = 40;   // row pitch: 320/8 = 40px
+        int y0 = 0;
+
+        cell(A, y0,       0, t_label,     t_sens,          1, t_mod,       t_high);
+        cell(B, y0,       1, "RH %",      id(rh_fused),    0, ${rh_mod},   ${rh_high});
+        cell(A, y0+rp,    2, "AH g/m³",   id(abs_humidity),1, ${ah_mod},   ${ah_high});
+        cell(B, y0+rp,    3, "CO2 ppm",   id(scd_co2),     0, ${co2_mod},  ${co2_high});
+        cell(A, y0+2*rp,  4, "PM1.0 µg",  id(pm_1_0),      1, ${pm1_mod},  ${pm1_high});
+        cell(B, y0+2*rp,  5, "PM2.5 µg",  id(pm_2_5),      1, ${pm25_mod}, ${pm25_high});
+        cell(A, y0+3*rp,  6, "PM4.0 µg",  id(pm_4_0),      1, ${pm4_mod},  ${pm4_high});
+        cell(B, y0+3*rp,  7, "PM10 µg",   id(pm_10_0),     1, ${pm10_mod}, ${pm10_high});
+        cell(A, y0+4*rp,  8, "VOC",       id(sen_voc),     0, ${voc_mod},  ${voc_high});
+        cell(B, y0+4*rp,  9, "NOx",       id(sen_nox),     0, ${nox_mod},  ${nox_high});
+        cell(A, y0+5*rp, 10, "NO2 ppm",   id(mics_no2),    2, ${no2_mod},  ${no2_high});
+        cell(B, y0+5*rp, 11, "CO ppm",    id(mics_co),     1, ${co_mod},   ${co_high});
+        cell(A, y0+6*rp, 12, "H2 ppm",    id(mics_h2),     1, ${h2_mod},   ${h2_high});
+        cell(B, y0+6*rp, 13, "EtOH ppm",  id(mics_etoh),   1, ${etoh_mod}, ${etoh_high});
+        cell(A, y0+7*rp, 14, "CH4 ppm",   id(mics_ch4),    0, ${ch4_mod},  ${ch4_high});
+        cell(B, y0+7*rp, 15, "NH3 ppm",   id(mics_nh3),    1, ${nh3_mod},  ${nh3_high});
       }
