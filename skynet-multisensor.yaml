@@ -65,16 +65,19 @@ substitutions:
   sigma_dht: "0.25"
   sigma_scd: "0.40"
   sigma_sen: "0.225"
+  sigma_sht: "0.10"
   outlier_k: "3.0"     # residual gate, in sigmas
 
   # ---- residual RH bias (%RH), from salt calibration. Usually 0. ----
   rhbias_dht: "0.0"
   rhbias_scd: "0.0"
   rhbias_sen: "0.0"
+  rhbias_sht: "0.0"
   # ---- 1-sigma (%RH) ----
   sigma_dht_rh: "1.75"   # spec ±2 inflated to ±3.5; use 1.0 if verified
   sigma_scd_rh: "3.00"
   sigma_sen_rh: "2.25"
+  sigma_sht_rh: "0.90"   # SHT41 spec ±1.8% → 1-sigma = 0.90
   rh_outlier_k: "3.0"
 
   # ---- SCD41 CO2 calibration ----
@@ -215,6 +218,9 @@ globals:
   # ---- last-change timestamps (millis) and previous values for 16 sensors ----
   - { id: prev_val,  type: 'float[16]', restore_value: no, initial_value: '{NAN,NAN,NAN,NAN,NAN,NAN,NAN,NAN,NAN,NAN,NAN,NAN,NAN,NAN,NAN,NAN}' }
   - { id: chg_ms,    type: 'uint32_t[16]', restore_value: no, initial_value: '{0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}' }
+  # ---- pressure trend tracking ----
+  - { id: prev_pressure, type: float, restore_value: no, initial_value: 'NAN' }
+  - { id: prev_pressure_ms, type: uint32_t, restore_value: no, initial_value: '0' }
 
 switch:
   - platform: restart
@@ -454,6 +460,8 @@ interval:
             apply(id(my_scd41), scd_ms);
             apply(id(sen55), ms);
             apply(id(mics), ms);
+            apply(id(sht41), ms);
+            apply(id(bmp390), ms);
             apply(id(wifi_signal_db), ms);
             // derived / fused
             apply(id(temp_fused), ms);
@@ -551,7 +559,7 @@ interval:
             if (period < 1) period = 1;
             if (id(tick) >= period) {
               id(tick) = 0;
-              id(page_index) = (id(page_index) + 1) % 4;
+              id(page_index) = (id(page_index) + 1) % 5;
               id(my_display).update();
             }
           } else {
@@ -643,6 +651,12 @@ font:
     id: font_big
     size: 44
     glyphs: *glyphset
+  - file: "gfonts://Material+Symbols+Outlined"
+    id: font_arrows
+    size: 24
+    glyphs:
+      - "\U0000e5d8"  # arrow_upward
+      - "\U0000e5db"  # arrow_downward
 
 color:
   - id: c_bg
@@ -933,6 +947,73 @@ sensor:
             value: nan
     update_interval: 60s
 
+  # ---- SHT41 temperature/humidity (Bus A, 0x44) ----
+  #  Higher accuracy than DHT22 (±0.2°C, ±1.8% RH). Exposed alongside
+  #  the DHT22 so you can compare and decide which to trust or fuse.
+  - platform: sht4x
+    id: sht41
+    i2c_id: bus_a
+    address: 0x44
+    precision: High
+    heater_power: Med
+    heater_time: Long
+    temperature:
+      name: "${upper_devicename} SHT41 Temperature"
+      id: sht41_temp
+      accuracy_decimals: 2
+      filters:
+        - timeout:
+            timeout: ${stale_timeout}
+            value: nan
+    humidity:
+      name: "${upper_devicename} SHT41 Humidity"
+      id: sht41_hum
+      accuracy_decimals: 1
+      filters:
+        - timeout:
+            timeout: ${stale_timeout}
+            value: nan
+    update_interval: 60s
+
+  # ---- BMP390 barometric pressure (Bus A, 0x77) ----
+  #  Provides local pressure for SCD41 CO2 compensation, eliminating
+  #  the need for the HA automation to push pressure externally.
+  - platform: bmp3xx_i2c
+    id: bmp390
+    i2c_id: bus_a
+    address: 0x77
+    temperature:
+      name: "${upper_devicename} BMP390 Temperature"
+      id: bmp390_temp
+      accuracy_decimals: 1
+      filters:
+        - timeout:
+            timeout: ${stale_timeout}
+            value: nan
+    pressure:
+      name: "${upper_devicename} BMP390 Pressure"
+      id: bmp390_pressure
+      accuracy_decimals: 2
+      unit_of_measurement: "inHg"
+      device_class: ""
+      state_class: measurement
+      filters:
+        - lambda: return x * 0.02953f;  // hPa to inHg
+        - timeout:
+            timeout: ${stale_timeout}
+            value: nan
+      on_value:
+        - lambda: |-
+            // Feed local pressure to SCD41 for CO2 compensation (needs mbar/hPa)
+            float hpa = x / 0.02953f;
+            int mbar = (int) hpa;
+            if (mbar > 0) {
+              id(my_scd41)->set_ambient_pressure_compensation(mbar);
+              id(last_pressure) = (float) mbar;
+              id(last_pressure_ms) = millis();
+            }
+    update_interval: 60s
+
   # ---- ambient pressure pushed in from Home Assistant ----
   - platform: template
     name: "${upper_devicename} Ambient Pressure"
@@ -1081,14 +1162,15 @@ sensor:
     # so no bias term appears here.
     lambda: |-
       struct Src { esphome::sensor::Sensor *s; float sigma; };
-      Src src[3] = {
+      Src src[4] = {
         { id(Temperature), ${sigma_dht} },
         { id(scd_temp),    ${sigma_scd} },
         { id(sen_temp),    ${sigma_sen} },
+        { id(sht41_temp),  ${sigma_sht} },
       };
 
-      float x[3], w[3]; bool ok[3]; int n = 0;
-      for (int i = 0; i < 3; i++) {
+      float x[4], w[4]; bool ok[4]; int n = 0;
+      for (int i = 0; i < 4; i++) {
         auto *s = src[i].s;
         ok[i] = s && s->has_state() && !std::isnan(s->state);
         if (!ok[i]) continue;
@@ -1100,16 +1182,17 @@ sensor:
 
       auto fit = [&]() {
         float sw = 0, swx = 0;
-        for (int i = 0; i < 3; i++) if (ok[i]) { sw += w[i]; swx += w[i] * x[i]; }
+        for (int i = 0; i < 4; i++) if (ok[i]) { sw += w[i]; swx += w[i] * x[i]; }
         return std::make_pair(swx / sw, sw);
       };
       auto r = fit();
       float mu = r.first, sw = r.second;
 
-      // reject one gross outlier, but only with all three alive
-      if (n == 3) {
+      // reject one gross outlier when 3+ sensors are alive
+      if (n >= 3) {
         int drop = -1; float worst = ${outlier_k};
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < 4; i++) {
+          if (!ok[i]) continue;
           float z = fabsf(x[i] - mu) / src[i].sigma;
           if (z > worst) { worst = z; drop = i; }
         }
@@ -1121,7 +1204,7 @@ sensor:
       }
 
       float chi2 = 0;
-      for (int i = 0; i < 3; i++) if (ok[i]) chi2 += w[i] * (x[i]-mu) * (x[i]-mu);
+      for (int i = 0; i < 4; i++) if (ok[i]) chi2 += w[i] * (x[i]-mu) * (x[i]-mu);
       id(g_chi2)  = (n > 1) ? chi2 / (n - 1) : 0.0f;
       id(g_sigma) = 1.0f / sqrtf(sw);
       id(g_n)     = n;
@@ -1172,38 +1255,35 @@ sensor:
         return b;
       };
 
-      // All three sensors now report RH referred to their own self-heated
-      // temperature, because their offset registers are zeroed and the
-      // correction happens in the temperature filters. So every source
-      // needs the es() rescaling from sensor temperature back to ambient.
+      // All sensors report RH referred to their own self-heated temperature,
+      // so every source needs the es() rescaling from sensor temp back to ambient.
+      // The SHT41 has no bias number (no self-heating correction needed) so tbias=0.
       struct Src {
         esphome::sensor::Sensor *rh;
         esphome::sensor::Sensor *t;
         float tbias; float rhbias; float sigma;
       };
-      Src src[3] = {
+      Src src[4] = {
         { id(Humidity),     id(Temperature), nval(id(bias_dht_num)), ${rhbias_dht}, ${sigma_dht_rh} },
         { id(scd_humidity), id(scd_temp),    nval(id(bias_scd_num)), ${rhbias_scd}, ${sigma_scd_rh} },
         { id(sen_hum),      id(sen_temp),    nval(id(bias_sen_num)), ${rhbias_sen}, ${sigma_sen_rh} },
+        { id(sht41_hum),    id(sht41_temp),  0.0f,                   ${rhbias_sht}, ${sigma_sht_rh} },
       };
 
-      float x[3], w[3], sg[3]; bool ok[3]; int n = 0;
-      for (int i = 0; i < 3; i++) {
+      float x[4], w[4], sg[4]; bool ok[4]; int n = 0;
+      for (int i = 0; i < 4; i++) {
         auto *s = src[i].rh;
         ok[i] = s && s->has_state() && !std::isnan(s->state);
         if (!ok[i]) continue;
 
-        // id(t)->state is ALREADY bias-corrected, i.e. ambient, so the
-        // sensor's own temperature is (state + tbias).
-        // Scale RH by es(T_sensor) / es(T_ambient).
         float f = 1.0f, sig = src[i].sigma;
         auto *ts = src[i].t;
         if (src[i].tbias != 0.0f) {
           if (ts && ts->has_state() && !std::isnan(ts->state)) {
-            float tamb = ts->state;                     // ambient (corrected)
-            f = es(tamb + src[i].tbias) / es(tamb);     // sensor / ambient
+            float tamb = ts->state;
+            f = es(tamb + src[i].tbias) / es(tamb);
           } else {
-            sig *= 2.0f;   // uncorrected: widen the error bar, don't drop it
+            sig *= 2.0f;
           }
         }
 
@@ -1211,7 +1291,7 @@ sensor:
         if (x[i] < 0.0f)   x[i] = 0.0f;
         if (x[i] > 100.0f) x[i] = 100.0f;
 
-        sg[i] = sig * f;              // scaling RH scales its uncertainty too
+        sg[i] = sig * f;
         w[i]  = 1.0f / (sg[i] * sg[i]);
         n++;
       }
@@ -1219,15 +1299,16 @@ sensor:
 
       auto fit = [&]() {
         float sw = 0, swx = 0;
-        for (int i = 0; i < 3; i++) if (ok[i]) { sw += w[i]; swx += w[i] * x[i]; }
+        for (int i = 0; i < 4; i++) if (ok[i]) { sw += w[i]; swx += w[i] * x[i]; }
         return std::make_pair(swx / sw, sw);
       };
       auto r = fit();
       float mu = r.first, sw = r.second;
 
-      if (n == 3) {
+      if (n >= 3) {
         int drop = -1; float worst = ${rh_outlier_k};
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < 4; i++) {
+          if (!ok[i]) continue;
           float z = fabsf(x[i] - mu) / sg[i];
           if (z > worst) { worst = z; drop = i; }
         }
@@ -1239,7 +1320,7 @@ sensor:
       }
 
       float chi2 = 0;
-      for (int i = 0; i < 3; i++) if (ok[i]) chi2 += w[i] * (x[i]-mu) * (x[i]-mu);
+      for (int i = 0; i < 4; i++) if (ok[i]) chi2 += w[i] * (x[i]-mu) * (x[i]-mu);
       id(g_rh_chi2)  = (n > 1) ? chi2 / (n - 1) : 0.0f;
       id(g_rh_sigma) = 1.0f / sqrtf(sw);
       id(g_rh_n)     = n;
@@ -1502,10 +1583,55 @@ display:
             big(gx,       y2, cw, ch, 14, "CH4 ppm",  id(mics_ch4),  0, ${ch4_mod},  ${ch4_high});
             big(gx+cw+gx, y2, cw, ch, 15, "NH3 ppm",  id(mics_nh3),  1, ${nh3_mod},  ${nh3_high});
             break;
+          case 4:
+            // Pressure with trend arrow + dew point
+            big(gx,       y1, cw, ch, 2, "Dew Pt °C", id(dew_point), 1, 15.0, 20.0);
+            big(gx+cw+gx, y1, cw, ch, 1, "AH g/m³",  id(abs_humidity), 1, ${ah_mod}, ${ah_high});
+            // Pressure card with trend arrow
+            {
+              int px = gx, py = y2, pw = cw * 2 + gx;  // full-width card
+              bool fresh = track(3, id(bmp390_pressure));
+              it.filled_rectangle(px, py, pw, ch, id(c_card));
+              it.rectangle(px, py, pw, ch, id(c_border));
+              Color stripe = fresh ? id(c_fresh) : id(c_dot);
+              it.filled_rectangle(px, py, 4, ch, stripe);
+              it.start_clipping(px + 4, py, px + pw, py + ch);
+              it.print(px + 10, py + 8, id(font_big_label), id(c_dim), TextAlign::TOP_LEFT, "Pressure inHg");
+              float pval = id(bmp390_pressure).has_state() ? id(bmp390_pressure).state : NAN;
+              char pbuf[16];
+              if (std::isnan(pval)) {
+                snprintf(pbuf, sizeof(pbuf), "--");
+              } else {
+                snprintf(pbuf, sizeof(pbuf), "%.2f", pval);
+              }
+              int vcx = px + pw / 2;
+              int vcy = py + (ch / 2) - 4;
+              it.printf(vcx, vcy, id(font_big), id(c_green), TextAlign::TOP_CENTER, "%s", pbuf);
+              // Trend arrow (or dot for stable)
+              if (!std::isnan(pval) && !std::isnan(id(prev_pressure))) {
+                float diff = pval - id(prev_pressure);
+                if (diff > 0.02f) {
+                  it.printf(px + pw - 12, py + 10, id(font_arrows), id(c_green), TextAlign::TOP_RIGHT, "\U0000e5d8");
+                } else if (diff < -0.02f) {
+                  it.printf(px + pw - 12, py + 10, id(font_arrows), id(c_yellow), TextAlign::TOP_RIGHT, "\U0000e5db");
+                } else {
+                  it.filled_circle(px + pw - 12, py + 20, 5, id(c_dim));
+                }
+              }
+              // Update previous pressure every 30 minutes
+              if (id(prev_pressure_ms) == 0 || (now - id(prev_pressure_ms)) > 1800000) {
+                if (!std::isnan(pval)) {
+                  id(prev_pressure) = pval;
+                  id(prev_pressure_ms) = now;
+                }
+              }
+              it.end_clipping();
+            }
+            break;
         }
         // Page indicator dots - bottom center
-        for (int i = 0; i < 4; i++) {
-          int dx = 96 + i * 16;
+        for (int i = 0; i < 5; i++) {
+          int dx = 88 + i * 16;
           if (i == id(page_index)) {
             it.filled_circle(dx, 312, 4, id(c_accent));
           } else {

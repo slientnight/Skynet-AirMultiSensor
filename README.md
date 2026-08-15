@@ -4,7 +4,7 @@
 |:---:|:---:|
 | <img src="Images/IMG_0819.jpeg" width="300"> | <img src="Images/IMG_0817.jpeg" width="300"> |
 
-An ESPHome air-quality and climate monitor built on an ESP32, combining four top-of-class sensors: a DHT22 for temperature and humidity, a Sensirion SCD41 for true NDIR CO2, a Sensirion SEN55 for PM1.0/2.5/4.0/10 particulates plus VOC and NOx indices, and a MICS-4514 for nitrogen dioxide, carbon monoxide, hydrogen, ethanol, methane, and ammonia.  Extensive thermal considerations to provide as accurate sensor readings as possible, along with multiple calibration tools. Tight integration with Home Assistant, with sensors and calibration tools exposed via API. A 240×320 ST7789V color display shows the readings in one of three user-selectable modes, with every value color-coded green, amber, or red against configurable thresholds. Display mode, page rotation speed, sensor polling interval, temperature units, and backlight brightness are all adjustable  from Home Assistant. The device also is as an active Bluetooth proxy and BLE tracker.
+An ESPHome air-quality and climate monitor built on an ESP32, combining six sensors: a DHT22 for temperature and humidity, a Sensirion SHT41 for high-accuracy temperature and humidity, a Sensirion SCD41 for true NDIR CO2, a Sensirion SEN55 for PM1.0/2.5/4.0/10 particulates plus VOC and NOx indices, a MICS-4514 for nitrogen dioxide, carbon monoxide, hydrogen, ethanol, methane, and ammonia, and a BMP390 for barometric pressure.  Extensive thermal considerations to provide as accurate sensor readings as possible, along with multiple calibration tools. The BMP390 provides on-board pressure compensation to the SCD41 for accurate CO2 readings without needing an external automation. Tight integration with Home Assistant, with sensors and calibration tools exposed via API. A 240×320 ST7789V color display shows the readings in one of three user-selectable modes, with every value color-coded green, amber, or red against configurable thresholds. Display mode, page rotation speed, sensor polling interval, temperature units, and backlight brightness are all adjustable from Home Assistant. The device also acts as an active Bluetooth proxy and BLE tracker.
 
 ---
 ## 📋 Table of Contents
@@ -28,6 +28,8 @@ An ESPHome air-quality and climate monitor built on an ESP32, combining four top
 
 - **High Accuracy Sensors** - Top-of-class specific sensor choices based on published accuracy data.  No more eCO2 or index gas levels.
 - **16 live measurements** across temperature, humidity, CO2, particulates, VOC/NOx, and six trace gases
+- **On-board barometric pressure** — BMP390 feeds the SCD41 pressure compensation automatically, no external automation needed
+- **4-sensor temperature/humidity fusion** — inverse-variance weighted average of DHT22, SCD41, SEN55, and SHT41, with automatic outlier rejection
 - **Three display modes**, switchable from Home Assistant:
   - **All 16** — dense single page, every value at once
   - **Rotating** — four pages of four values in large type, auto-advancing, with page indicator dots
@@ -36,7 +38,7 @@ An ESPHome air-quality and climate monitor built on an ESP32, combining four top
 - **Tight Integration with Home Assistant / ESPHome** — no reflashing needed to change display mode, rotation speed, sensor polling interval, °F/°C, or backlight brightness
 - **Bluetooth proxy** — active proxy with 3 connections plus continuous BLE tracking, extending Home Assistant's Bluetooth range
 - **Extensive Calibration Options** - For those who need even more accuracy! Temp, Humidity, CO2 calibrations
-- **Gaussian Sensor Weighting** - provides a fused temperature and humidity readings based on the published performance of the different sensors.
+- **Gaussian Sensor Weighting** - provides a fused temperature and humidity reading based on the published performance of all four temperature/humidity sensors (DHT22, SCD41, SEN55, SHT41). The SHT41 carries the highest weight due to its superior accuracy (±0.2°C).
 - **Thermal Optimization** Thermal considerations and isolation were a big part of the case design, trying to prevent sensor/display related heating to effect sensor readings. Case designed to have the hot sensors far from the cooler sensors, and all sensors exposed to outside air instead of inside, and thermal insulation between center chamber and side chambers, and cooling chimneys on the top.
 
 | Thermal Front | Thermal Back | 3D Print |
@@ -58,9 +60,11 @@ All 3D printable files and print profiles for the enclosures are hosted on Maker
 |---|---|---|---|---|
 | MCU | Freenove ESP32-WROOM (ESP32 rev3.1, 4MB flash, no PSRAM) | — | https://www.amazon.com/dp/B0C9THDPXP | 18.95 (for 2) |
 | Temp / humidity | DHT22 (AM2302) | 1-Wire | https://www.amazon.com/dp/B0CPHQC9SF | 9.99 (for 3) |
+| Temp / humidity (precision) | Sensirion SHT41 | I²C bus A | — | ~5 |
 | CO2 | Sensirion SCD41 | I²C bus A | https://www.amazon.com/dp/B0GWQMQVN8 | 19.99 |
 | Particulate / VOC / NOx | Sensirion SEN55 | I²C bus B | https://www.seeedstudio.com/Grove-All-in-one-Environmental-Sensor-SEN55-p-5373.html | $59 | 
 | Trace gases | MICS-4514 | I²C bus A | https://www.amazon.com/dp/B09G9PZ4XZ | 42.90 |
+| Barometric pressure | BMP390 (CJMCU-390) | I²C bus A | — | ~5 |
 | Display | ST7789V 240×320 IPS, SPI | SPI (VSPI) | https://www.amazon.com/dp/B082GFTZQD | 17.27 |
 | Grove breakout cable (optional) | — | — | https://www.amazon.com/dp/B074MDM36N | 9.99 (for 5) |
 | M3x4 and M2x4 screws | - | - | - |
@@ -92,6 +96,8 @@ Gravity cable (for the SCD41) - green = SDA, Blue = SCL, Red = 3.3V, Black = Gro
 
 4. Make sure to solder the pins to the SCD41 board to the backside (opposite the sensor)
 5. DHT22: 3.3V, GND, signal to GPIO25
+6. SHT41: connect SDA to GPIO26, SCL to GPIO17, VCC to 3.3V, GND to GND (same bus as SCD41/MICS)
+7. BMP390: connect SDA to GPIO26, SCL to GPIO17, VCC to 3.3V, GND to GND (same bus as SCD41/MICS)
 
 6. Display hookup (these are the colors of the cable that came with my display, YMMV):
 DC - blue - GPIO4
@@ -143,12 +149,13 @@ BL - grey - GPIO32
 1) Diplay backlight - turning this off will blank display
 2) Display mode:
     - All 16 - all 16 sensors on a single screen, but small
-    - Rotating - 4 sensors on each screen (bigger), rotating through 4 pages (speed adjustable)
+    - Rotating - 4 sensors on each screen (bigger), rotating through 5 pages (speed adjustable)
     - Highlights - 4 sensors on single screen (bigger) - temp, VOC, PM2.5, and CO2.
 
 <p align="left">
 <img src="Images/IMG_0819.jpeg" alt="alt text" width="300">
 <img src="Images/IMG_0820.jpeg" alt="alt text" width="300">
+<img src="Images/IMG_7703.JPEG" alt="Pressure page with trend arrow" width="300">
 </p>
 
 3) Status LED - there is an on-chip light that is controlable, but probably not visable from outside the case.
@@ -166,14 +173,14 @@ BL - grey - GPIO32
 
 <img src="Images/sensors.png" alt="alt text" width="300">
 
-1) Sensor data exposed to home assistant shown above.  Note "Temperature Fused" and "Humidity Fused" are caculated from all 3 sensors and adjusted by known sensor accuracy.  Absolute Humidity and Dew Point are also calculated from the fused data.
+1) Sensor data exposed to home assistant shown above.  Note "Temperature Fused" and "Humidity Fused" are calculated from all 4 temperature/humidity sensors (DHT22, SCD41, SEN55, SHT41) and weighted by known sensor accuracy. The SHT41 carries the highest weight. Absolute Humidity and Dew Point are also calculated from the fused data.
 2) Wifi data also available "Diagnostic" panel - not pictured.
 
 ---
 
 ## Calibrations
 
-1) Set Ambient Pressure: The SCD41 relies on accurate atmospheric pressures to report CO2 - not setting this can cause variations up to 20%.  Use a home assistant automation to pull current atmospheric pressure from some other sensor (or web API) in mbar and push it to the sensor.  Set an automation with a time trigger ~ 1 hr with the action:
+1) Set Ambient Pressure: The SCD41 relies on accurate atmospheric pressures to report CO2 - not setting this can cause variations up to 20%.  If a BMP390 is installed, pressure compensation is handled automatically on-board — no automation needed. Otherwise, use a Home Assistant automation to pull current atmospheric pressure from some other sensor (or web API) in mbar and push it to the sensor.  Set an automation with a time trigger ~ 1 hr with the action:
 
 ```yaml
 action: esphome.skynet_multisensor_set_ambient_pressure
@@ -211,12 +218,12 @@ Two separate buses are used because the SEN55 and SCD41 both benefit from short,
 
 | Bus | Signal | GPIO | Devices |
 |---|---|---|---|
-| **Bus A** | SDA | `GPIO26` | SCD41, MICS-4514 |
+| **Bus A** | SDA | `GPIO26` | SCD41, MICS-4514, SHT41, BMP390 |
 | **Bus A** | SCL | `GPIO17` | |
 | **Bus B** | SDA | `GPIO21` | SEN55 |
 | **Bus B** | SCL | `GPIO22` | |
 
-Both buses run at 50 kHz. 
+Both buses run at 50 kHz. Bus A is 3.3V, Bus B is 5V. 
 
 ### DHT22
 
@@ -272,7 +279,14 @@ GPIO5 is technically a strapping pin, but it's the ESP32's default VSPI CS and i
 | DHT22 Temperature | °C |
 | DHT22 Temperature F | °F |
 | DHT22 Humidity | % |
-| DHT22 Absolute Humidity | g/m³ |
+| SHT41 Temperature | °C |
+| SHT41 Humidity | % |
+| BMP390 Temperature | °C |
+| BMP390 Pressure | inHg |
+| Temperature Fused | °C |
+| Humidity Fused | % |
+| Absolute Humidity | g/m³ |
+| Dew Point | °C |
 | CO2 | ppm |
 | SD41 Temperature / Humidity | °C / % |
 | PM <1µm, <2.5µm, <4µm, <10µm | µg/m³ |
